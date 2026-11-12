@@ -1,0 +1,38 @@
+/* Inner emphasis (replaces nested *asterisks* inside an italic span).
+
+   SillyTavern's message sanitizer rewrites class names in message HTML with a
+   "custom-" prefix, so the <span class="nef-emph"> we emit arrives in the page as
+   class="custom-nef-emph". Every rule therefore targets both spellings.
+
+   The look is chosen via a data attribute on <body>, so changing the style in
+   settings applies instantly to every existing message. */
+
+/* Reverse italics: the classic typographic way to emphasise inside italics */
+body[data-nef-style="roman"] .nef-emph,
+body[data-nef-style="roman"] .custom-nef-emph {
+    font-style: normal;
+}
+
+body[data-nef-style="bold"] .nef-emph,
+body[data-nef-style="bold"] .custom-nef-emph {
+    font-style: normal;
+    font-weight: 700;
+}
+
+body[data-nef-style="glow"] .nef-emph,
+body[data-nef-style="glow"] .custom-nef-emph {
+    font-style: normal;
+    font-weight: 600;
+    text-shadow: 0 0 4px currentColor, 0 0 10px currentColor;
+}
+
+body[data-nef-style="underline"] .nef-emph,
+body[data-nef-style="underline"] .custom-nef-emph {
+    font-style: normal;
+    text-decoration: underline dotted;
+    text-underline-offset: 3px;
+}
+
+.nef-settings .nef-row {
+    margin: 6px 0;
+}
