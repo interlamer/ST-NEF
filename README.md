@@ -3,9 +3,6 @@
 A SillyTavern extension that fixes broken rendering when a model puts `*emphasis*` inside an
 already-italic `*span*`.
 
-In the common RP convention (plain text = narration, "quotes" = speech, `*italics*` = thoughts),
-models sometimes write:
-
 ```
 *This is some thought. Oops, something *important* is happening. And now rendering is broken.*
 ```
@@ -18,14 +15,12 @@ This extension detects those collisions and either:
 
 It also works when the text is wrapped in HTML color tags such as `<font color="#ff6666">...</font>`.
 
-<!-- Add a before/after screenshot here: ![before and after](screenshots/before-after.png) -->
-
 ## Install
 
 In SillyTavern: **Extensions → Install extension**, paste
 
 ```
-https://github.com/YOUR_USERNAME/SillyTavern-NestedEmphasisFixer
+https://github.com/interlamer/ST-NEF
 ```
 
 choose the install scope, and click Install. Updates are offered through the Extensions panel.
