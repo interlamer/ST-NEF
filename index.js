@@ -1,14 +1,17 @@
-// Nested Emphasis Fixer for SillyTavern  (v1.2.0)
+// Nested Emphasis Fixer for SillyTavern  (v1.3.0)
 //
 // Finds *italic spans* that contain another *italic* span and either
 //   - "strip": removes the inner asterisks, or
 //   - "style": swaps them for a styled <span class="nef-emph"> (see style.css)
 //
-// Two delivery methods (chosen automatically):
-//   1. Render-time hook (messageFormatter.addHook): fixes text on its way to the
-//      screen, never touches saved chat data. Only exists on newer/staging builds.
-//   2. Fallback: rewrites the saved message on MESSAGE_RECEIVED / MESSAGE_SENT,
-//      before it is rendered.
+// Ephemerality (modelled on SillyTavern's Regex extension):
+//   - Alter Chat Display:    fix text as it is rendered (needs the messageFormatter hook,
+//                            a newer/staging feature). Saved chat is not modified.
+//   - Alter Outgoing Prompt: fix the history sent to the model (via generate_interceptor).
+//                            Saved chat is not modified.
+//   - Neither checked:       rewrite the saved message itself when it arrives / is sent
+//                            (irreversible). Also used as the fallback when Alter Chat
+//                            Display is requested but the hook doesn't exist.
 
 (() => {
     'use strict';
@@ -19,7 +22,7 @@
     // Private-use characters: survive Markdown untouched; swapped for <span> after it.
     const MARK_OPEN = '\uE000';
     const MARK_CLOSE = '\uE001';
-    const DEFAULTS = { enabled: true, mode: 'strip', style: 'glow', fixUser: true, preferRenderHook: true };
+    const DEFAULTS = { enabled: true, mode: 'strip', style: 'glow', fixUser: true, alterDisplay: true, alterPrompt: true };
 
     /* ------------------------------------------------------------------ *
      *  Core logic (pure functions, no SillyTavern dependencies)
@@ -148,6 +151,25 @@
     const SPAN_RE = new RegExp(`<span class="${SPAN_CLASS}">([\\s\\S]*?)</span>`, 'g');
     const stripSpans = (s) => (typeof s === 'string' ? s.replace(SPAN_RE, '$1') : s);
 
+    /**
+     * Ephemeral prompt fix. Replaces each changed message in `chat` (the array handed to a
+     * generate_interceptor) with a modified COPY, so the original message objects, and
+     * therefore the saved chat, are never altered. System/hidden messages are skipped.
+     */
+    function fixPromptChat(chat, { fixUser = true } = {}) {
+        let changed = 0;
+        for (let i = 0; i < chat.length; i++) {
+            const m = chat[i];
+            if (!m || m.is_system || typeof m.mes !== 'string') continue;
+            if (m.is_user && !fixUser) continue;
+            const fixed = stripSpans(fixText(m.mes, 'strip'));
+            if (fixed === m.mes) continue;
+            chat[i] = { ...m, mes: fixed };
+            changed++;
+        }
+        return changed;
+    }
+
     /** Fix msg.mes and every stored swipe. Returns true if anything changed. */
     function fixMessage(msg, mode) {
         if (!msg || typeof msg.mes !== 'string') return false;
@@ -170,7 +192,7 @@
 
     // Allow running the core in Node for tests; harmless inside SillyTavern.
     if (typeof module !== 'undefined' && module.exports) {
-        module.exports = { fixText, fixMessage, stripSpans, markersToHtml };
+        module.exports = { fixText, fixMessage, fixPromptChat, stripSpans, markersToHtml };
     }
 
     /* ------------------------------------------------------------------ *
@@ -184,17 +206,47 @@
     function loadSettings() {
         const { extensionSettings } = SillyTavern.getContext();
         if (!extensionSettings[MODULE]) extensionSettings[MODULE] = {};
+        const cur = extensionSettings[MODULE];
+        // Migrate the 1.1/1.2 "preferRenderHook" option to "Alter Chat Display".
+        if (cur.alterDisplay === undefined && cur.preferRenderHook !== undefined) cur.alterDisplay = cur.preferRenderHook;
+        delete cur.preferRenderHook;
         for (const [k, v] of Object.entries(DEFAULTS)) {
-            if (extensionSettings[MODULE][k] === undefined) extensionSettings[MODULE][k] = v;
+            if (cur[k] === undefined) cur[k] = v;
         }
-        return extensionSettings[MODULE];
+        return cur;
     }
 
     const save = () => SillyTavern.getContext().saveSettingsDebounced();
     const applyStyleAttr = (s) => { document.body.dataset.nefStyle = s.style; };
-    const usingRenderHook = (s) => state.renderHookInstalled && s.preferRenderHook;
 
-    /** Method 1: render-time hook (documented as a staging-branch feature). */
+    /** What actually happens, given the Ephemerality checkboxes and what this build supports. */
+    function plan(s) {
+        const hook = state.renderHookInstalled;
+        return {
+            displayViaHook: s.alterDisplay && hook,
+            // Same rule as the Regex extension: neither box = edit the saved text.
+            // Also the fallback when display alteration is requested but impossible.
+            rewriteSaved: (!s.alterDisplay && !s.alterPrompt) || (s.alterDisplay && !hook),
+            prompt: s.alterPrompt,
+        };
+    }
+
+    function describePlan(s) {
+        const p = plan(s);
+        const parts = [];
+        if (p.displayViaHook) parts.push('Chat display is fixed as it is rendered.');
+        if (p.prompt) parts.push('The outgoing prompt is fixed.');
+        if (p.rewriteSaved) parts.push('Saved messages are rewritten (irreversible).');
+        if (s.alterDisplay && !state.renderHookInstalled) {
+            parts.push('Alter Chat Display needs a newer SillyTavern (message formatting hook), so saved messages are rewritten instead.');
+        }
+        if (!p.rewriteSaved && p.displayViaHook !== p.prompt) {
+            parts.push('You will see one thing and the model will see another.');
+        }
+        return parts.join(' ');
+    }
+
+    /** Alter Chat Display: render-time hook (documented as a staging-branch feature). */
     function tryInstallRenderHook(ctx) {
         const mf = ctx.messageFormatter;
         if (!mf || typeof mf.addHook !== 'function') return false;
@@ -203,7 +255,7 @@
             mf.addHook(
                 (mes, c) => {
                     const s = loadSettings();
-                    if (!s.enabled || !s.preferRenderHook) return mes;
+                    if (!s.enabled || !s.alterDisplay) return mes;
                     if (c && c.isUser && !s.fixUser) return mes;
                     return fixText(mes, s.mode === 'style' ? 'marker' : 'strip');
                 },
@@ -212,22 +264,37 @@
             mf.addHook((mes) => markersToHtml(mes), { stage: stage.AFTER_MARKDOWN ?? 'afterMarkdown' });
             return true;
         } catch (err) {
-            console.warn(LOG, 'messageFormatter hook registration failed, using fallback:', err);
+            console.warn(LOG, 'messageFormatter hook registration failed:', err);
             return false;
         }
     }
 
-    /** Method 2: fix the saved message before it is rendered. */
+    /** Neither checked (or display hook unavailable): fix the saved message before it renders. */
     function onMessageFixEvent(isUserEvent) {
         return (messageId) => {
             const s = loadSettings();
-            if (!s.enabled || usingRenderHook(s)) return;
+            if (!s.enabled || !plan(s).rewriteSaved) return;
             if (isUserEvent && !s.fixUser) return;
             const { chat } = SillyTavern.getContext();
-            const changed = fixMessage(chat[messageId], s.mode);
-            if (changed) console.debug(LOG, 'fixed message', messageId);
+            if (fixMessage(chat[messageId], s.mode)) console.debug(LOG, 'rewrote message', messageId);
         };
     }
+
+    /**
+     * Alter Outgoing Prompt: called by SillyTavern before each generation, because the manifest
+     * names it in "generate_interceptor". Works for chat- and text-completion APIs alike and only
+     * ever sees chat messages (never character cards or system prompts).
+     */
+    globalThis.nestedEmphasisFixerInterceptor = async function (chat /*, contextSize, abort, type */) {
+        try {
+            const s = loadSettings();
+            if (!s.enabled || !s.alterPrompt || !Array.isArray(chat)) return;
+            const n = fixPromptChat(chat, { fixUser: s.fixUser });
+            if (n) console.debug(LOG, `cleaned ${n} message(s) in the outgoing prompt`);
+        } catch (err) {
+            console.warn(LOG, 'prompt interceptor failed:', err);
+        }
+    };
 
     async function scanChat() {
         const s = loadSettings();
@@ -252,7 +319,6 @@
                     <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
                 </div>
                 <div class="inline-drawer-content">
-                    <small id="nef_status" class="nef-row"></small>
                     <label class="checkbox_label nef-row">
                         <input type="checkbox" id="nef_enabled">
                         <span>Enabled</span>
@@ -260,10 +326,6 @@
                     <label class="checkbox_label nef-row">
                         <input type="checkbox" id="nef_fixuser">
                         <span>Also fix my own messages</span>
-                    </label>
-                    <label class="checkbox_label nef-row">
-                        <input type="checkbox" id="nef_hook">
-                        <span>Prefer render-time hook when available</span>
                     </label>
                     <div class="nef-row">
                         <label for="nef_mode">Fix method</label>
@@ -281,6 +343,17 @@
                             <option value="underline">Dotted underline</option>
                         </select>
                     </div>
+                    <div class="nef-row"><b>Ephemerality</b></div>
+                    <label class="checkbox_label nef-row" title="Fix emphasis as messages are shown on screen. The saved chat is not modified.">
+                        <input type="checkbox" id="nef_alter_display">
+                        <span>Alter Chat Display</span>
+                    </label>
+                    <label class="checkbox_label nef-row" title="Fix emphasis in the chat history sent to the model. The saved chat is not modified.">
+                        <input type="checkbox" id="nef_alter_prompt">
+                        <span>Alter Outgoing Prompt</span>
+                    </label>
+                    <small class="nef-row">If neither box is checked, the fix is written into the saved messages themselves (irreversible).</small>
+                    <small id="nef_status" class="nef-row"></small>
                     <div class="nef-row">
                         <label for="nef_test_in">Try it (type or paste text)</label>
                         <textarea id="nef_test_in" class="text_pole" rows="2">*this is a *test* of the italics fix.*</textarea>
@@ -295,14 +368,7 @@
         </div>`;
         $('#extensions_settings2').append(html);
 
-        const refreshStatus = () => {
-            $('#nef_status').text(
-                usingRenderHook(s)
-                    ? 'Active method: render-time hook (saved messages are not modified).'
-                    : 'Active method: rewriting messages as they arrive/are sent (render-time hook ' +
-                      (state.renderHookInstalled ? 'available but turned off).' : 'not available in this version).'),
-            );
-        };
+        const refreshStatus = () => $('#nef_status').text(describePlan(s));
         const refreshTest = () => {
             const t = String($('#nef_test_in').val());
             $('#nef_test_strip').text(fixText(t, 'strip'));
@@ -311,8 +377,13 @@
 
         $('#nef_enabled').prop('checked', s.enabled).on('change', function () { s.enabled = $(this).prop('checked'); save(); });
         $('#nef_fixuser').prop('checked', s.fixUser).on('change', function () { s.fixUser = $(this).prop('checked'); save(); });
-        $('#nef_hook').prop('checked', s.preferRenderHook).on('change', function () {
-            s.preferRenderHook = $(this).prop('checked');
+        $('#nef_alter_display').prop('checked', s.alterDisplay).on('change', function () {
+            s.alterDisplay = $(this).prop('checked');
+            save();
+            refreshStatus();
+        });
+        $('#nef_alter_prompt').prop('checked', s.alterPrompt).on('change', function () {
+            s.alterPrompt = $(this).prop('checked');
             save();
             refreshStatus();
         });
@@ -336,8 +407,8 @@
         eventSource.on(event_types.MESSAGE_RECEIVED, onMessageFixEvent(false));
         eventSource.on(event_types.MESSAGE_SENT, onMessageFixEvent(true));
 
-        // Keep stored styled <span>s out of what the model sees (they cost tokens and
-        // the model might imitate the HTML). Event names per SillyTavern's events.js.
+        // Safety net, independent of the Ephemerality settings: our own styled <span> markup
+        // must never reach the model. (Event names per SillyTavern's events.js.)
         if (event_types.CHAT_COMPLETION_PROMPT_READY) {
             eventSource.on(event_types.CHAT_COMPLETION_PROMPT_READY, (data) => {
                 if (!data || !Array.isArray(data.chat)) return;
