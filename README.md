@@ -52,9 +52,10 @@ The two checkboxes work like the ones in SillyTavern's built-in Regex extension:
 |  |  | The fix is written into the saved messages themselves (irreversible). |
 
 *Alter Chat Display* needs SillyTavern's message-formatting hook (documented as a staging-branch
-feature at the time of writing). If your version doesn't have it, the extension falls back to
-rewriting the saved message as it arrives or is sent, and the settings panel says so. In that
-fallback, a reply that is still streaming may briefly render with the original asterisks.
+feature at the time of writing). If your version doesn't have it, the chat display is simply not
+fixed and the settings panel says so. Since 1.4.0 the extension no longer silently falls back to
+rewriting saved messages: that only happens when you uncheck both boxes yourself. In that mode a
+reply that is still streaming may briefly render with the original asterisks.
 
 The status line under the checkboxes always describes what is actually happening.
 
@@ -68,7 +69,7 @@ It deliberately does nothing when it can't be sure:
 
 - italics that are never closed in the paragraph
 - `**bold**` runs (these already nest fine inside italics)
-- code spans and fenced code blocks
+- code spans (any number of backticks) and fenced code blocks (```` ``` ```` or `~~~`)
 - escaped `\*`, asterisks inside HTML attributes, and ambiguous mid-word asterisks
 - list bullets
 
@@ -76,8 +77,12 @@ It deliberately does nothing when it can't be sure:
 
 With only *Alter Chat Display*, the model still sees the original nested asterisks in its history,
 which may encourage it to keep producing them. *Alter Outgoing Prompt* removes them from what the
-model sees (chat messages only; character cards and system prompts are never touched). Styled
-`<span>` markup is always stripped from the prompt, whatever the settings.
+model sees (chat messages only; character cards and system prompts are never fixed). As a safety
+net, the extension's own `<span class="nef-emph">` markup is always stripped from the whole final
+prompt, whatever the settings; nothing else in the prompt is changed by that step.
+
+The *Rewrite saved messages* button asks for confirmation first, respects *Also fix my own
+messages*, and skips system messages.
 
 ## Notes
 

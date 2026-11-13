@@ -1,4 +1,4 @@
-// Nested Emphasis Fixer for SillyTavern  (v1.3.0)
+// Nested Emphasis Fixer for SillyTavern  (v1.4.0)
 //
 // Finds *italic spans* that contain another *italic* span and either
 //   - "strip": removes the inner asterisks, or
@@ -10,8 +10,8 @@
 //   - Alter Outgoing Prompt: fix the history sent to the model (via generate_interceptor).
 //                            Saved chat is not modified.
 //   - Neither checked:       rewrite the saved message itself when it arrives / is sent
-//                            (irreversible). Also used as the fallback when Alter Chat
-//                            Display is requested but the hook doesn't exist.
+//                            (irreversible). This only ever happens when the user chose it:
+//                            a missing render hook no longer silently falls back to it.
 
 (() => {
     'use strict';
@@ -20,8 +20,9 @@
     const LOG = '[NestedEmphasisFixer]';
     const SPAN_CLASS = 'nef-emph';
     // Private-use characters: survive Markdown untouched; swapped for <span> after it.
-    const MARK_OPEN = '\uE000';
-    const MARK_CLOSE = '\uE001';
+    const MARK_OPEN = '';
+    const MARK_CLOSE = '';
+    const MARKER_RE = /[]/g;
     const DEFAULTS = { enabled: true, mode: 'strip', style: 'glow', fixUser: true, alterDisplay: true, alterPrompt: true };
 
     /* ------------------------------------------------------------------ *
@@ -45,6 +46,7 @@
         return null;
     }
 
+    const TAG_RE = /<\/?[A-Za-z][^<>]*>/g;
     const BREAK_TAG_RE = /^<\/?(br|p|div|hr|li|ul|ol|blockquote|h[1-6]|table|tr|td|th|pre)\b/i;
 
     /** What replaces an inner asterisk, per mode. */
@@ -54,24 +56,59 @@
         return ['', '']; // strip
     }
 
+    /**
+     * Marks every character that sits inside an inline code span. Follows CommonMark:
+     * a run of N backticks is closed by the next run of exactly N backticks, so
+     * ``a ` b`` is one code span. Linear time.
+     */
+    function inlineCodeMask(par) {
+        const mask = new Uint8Array(par.length);
+        if (!par.includes('`')) return mask;
+        const runs = [];
+        for (const m of par.matchAll(/`+/g)) runs.push({ s: m.index, e: m.index + m[0].length, n: m[0].length });
+        // nextSame[k] = index of the next run with the same length (or -1)
+        const nextSame = new Int32Array(runs.length).fill(-1);
+        const seen = new Map();
+        for (let k = runs.length - 1; k >= 0; k--) {
+            const j = seen.get(runs[k].n);
+            if (j !== undefined) nextSame[k] = j;
+            seen.set(runs[k].n, k);
+        }
+        for (let k = 0; k < runs.length;) {
+            const j = nextSame[k];
+            if (j < 0) { k++; continue; }
+            mask.fill(1, runs[k].s, runs[j].e);
+            k = j + 1;
+        }
+        return mask;
+    }
+
     function fixParagraph(par, mode) {
         if (!par.includes('*')) return par;
 
-        const codeRanges = [...par.matchAll(/`[^`\n]*`/g)].map((m) => [m.index, m.index + m[0].length]);
+        const inCode = inlineCodeMask(par);
 
         // HTML tags (e.g. <font color="...">) must be invisible when judging what sits
         // next to an asterisk: in `done.*</font>` the `*` is really followed by whatever
         // comes after the tag, not by '<'. Line-break-like tags count as whitespace.
-        const tags = [...par.matchAll(/<\/?[A-Za-z][^<>]*>/g)].map((m) => ({
-            s: m.index,
-            e: m.index + m[0].length,
-            brk: BREAK_TAG_RE.test(m[0]),
-        }));
-        const insideTag = (i) => tags.some((t) => i >= t.s && i < t.e);
+        // Lookups are O(1) (mask + maps) so the whole pass stays linear in the paragraph.
+        const inTag = new Uint8Array(par.length);
+        const tagByStart = new Map();
+        const tagByEnd = new Map();
+        if (par.includes('<')) {
+            for (const m of par.matchAll(TAG_RE)) {
+                const t = { s: m.index, e: m.index + m[0].length, brk: BREAK_TAG_RE.test(m[0]) };
+                inTag.fill(1, t.s, t.e);
+                tagByStart.set(t.s, t);
+                tagByEnd.set(t.e, t);
+            }
+        }
+        // Each walk only crosses the tags between this asterisk and the nearest
+        // real character, so every tag is crossed at most twice in total.
         const prevChar = (i) => {
             let j = i - 1;
             for (;;) {
-                const t = tags.find((x) => x.e === j + 1);
+                const t = tagByEnd.get(j + 1);
                 if (!t) return par[j];
                 if (t.brk) return ' ';
                 j = t.s - 1;
@@ -80,7 +117,7 @@
         const nextChar = (i) => {
             let j = i + 1;
             for (;;) {
-                const t = tags.find((x) => x.s === j);
+                const t = tagByStart.get(j);
                 if (!t) return par[j];
                 if (t.brk) return ' ';
                 j = t.e;
@@ -92,12 +129,13 @@
         for (const m of par.matchAll(/\*+/g)) {
             if (m[0].length !== 1) continue;
             const i = m.index;
-            if (codeRanges.some(([a, b]) => i >= a && i < b)) continue;
-            if (insideTag(i)) continue; // e.g. an asterisk inside an attribute value
+            if (inCode[i]) continue;
+            if (inTag[i]) continue; // e.g. an asterisk inside an attribute value
             if (par[i - 1] === '\\') continue;
             const role = classify(prevChar(i), nextChar(i));
             if (role) tokens.push({ i, role });
         }
+        if (tokens.length < 4) return par; // a nested pair needs at least 4 delimiters
 
         // Pair them with a stack. A pair whose opener was pushed while another
         // opener was already open is "inner".
@@ -128,10 +166,14 @@
         return out + par.slice(last);
     }
 
+    // Fenced code (``` or ~~~). An unclosed fence runs to the end of the text, as in
+    // CommonMark (and as while a reply is still streaming).
+    const FENCE_RE = /(```[\s\S]*?(?:```|$)|~~~[\s\S]*?(?:~~~|$))/g;
+
     function fixText(text, mode) {
         if (typeof text !== 'string' || !text.includes('*')) return text;
         return text
-            .split(/(```[\s\S]*?```)/g) // odd chunks = fenced code, untouched
+            .split(FENCE_RE) // odd chunks = fenced code, untouched
             .map((chunk, idx) => {
                 if (idx % 2 === 1) return chunk;
                 // Emphasis can't cross blank lines, so handle each paragraph separately
@@ -143,13 +185,99 @@
             .join('');
     }
 
-    const markersToHtml = (s) =>
-        s.includes(MARK_OPEN) || s.includes(MARK_CLOSE)
-            ? s.split(MARK_OPEN).join(`<span class="${SPAN_CLASS}">`).split(MARK_CLOSE).join('</span>')
-            : s;
+    /**
+     * Small LRU cache for the render hook: chat loads, swipes and updateMessageBlock
+     * re-render the same text many times.
+     */
+    const CACHE_MAX = 64;
+    const cache = new Map();
+    function fixTextCached(text, mode) {
+        if (typeof text !== 'string' || !text.includes('*')) return text;
+        const key = mode + '\u0000' + text;
+        const hit = cache.get(key);
+        if (hit !== undefined) {
+            cache.delete(key);
+            cache.set(key, hit);
+            return hit;
+        }
+        const out = fixText(text, mode);
+        cache.set(key, out);
+        if (cache.size > CACHE_MAX) cache.delete(cache.keys().next().value);
+        return out;
+    }
 
-    const SPAN_RE = new RegExp(`<span class="${SPAN_CLASS}">([\\s\\S]*?)</span>`, 'g');
-    const stripSpans = (s) => (typeof s === 'string' ? s.replace(SPAN_RE, '$1') : s);
+    /**
+     * Turns our private-use markers into <span>s after Markdown. Only markers in text
+     * content are converted, and only in matched pairs: a marker that ended up inside a
+     * tag (e.g. a link URL produced by Markdown) or without a partner is dropped, so the
+     * output can never break an attribute or leave unbalanced tags.
+     */
+    function markersToHtml(s) {
+        if (typeof s !== 'string' || !(s.includes(MARK_OPEN) || s.includes(MARK_CLOSE))) return s;
+        const OPEN = `<span class="${SPAN_CLASS}">`;
+        const out = [];
+        const openIdx = []; // positions in `out` of still-unmatched openers
+        let inTag = false;
+        let quote = '';
+        let buf = '';
+        const flush = () => { if (buf) { out.push(buf); buf = ''; } };
+        for (let i = 0; i < s.length; i++) {
+            const ch = s[i];
+            if (inTag) {
+                if (quote) { if (ch === quote) quote = ''; }
+                else if (ch === '"' || ch === "'") quote = ch;
+                else if (ch === '>') inTag = false;
+                if (ch !== MARK_OPEN && ch !== MARK_CLOSE) buf += ch;
+                continue;
+            }
+            // Only a real tag start (`<a`, `</a`, `<!--`) opens a tag; a stray `a < b` does not.
+            if (ch === '<' && /[A-Za-z\/!]/.test(s[i + 1] || '')) { inTag = true; buf += ch; continue; }
+            if (ch === MARK_OPEN) {
+                flush();
+                openIdx.push(out.length);
+                out.push(OPEN);
+            } else if (ch === MARK_CLOSE) {
+                if (openIdx.length) {
+                    flush();
+                    openIdx.pop();
+                    out.push('</span>');
+                }
+            } else {
+                buf += ch;
+            }
+        }
+        flush();
+        for (const k of openIdx) out[k] = ''; // unmatched opener
+        return out.join('');
+    }
+
+    /**
+     * Removes our own <span class="nef-emph"> wrappers (and only their matching
+     * </span>) in one linear pass. Handles nested spans and unclosed openers.
+     */
+    const SPAN_TAG_RE = /<span\b[^<>]*>|<\/span\s*>/gi;
+    const OUR_SPAN_RE = new RegExp(`^<span\\s+class=(["'])(?:custom-)?${SPAN_CLASS}\\1\\s*>$`, 'i');
+    function stripSpans(s) {
+        if (typeof s !== 'string' || !s.includes(SPAN_CLASS)) return s;
+        const stack = [];
+        let out = '';
+        let last = 0;
+        for (const m of s.matchAll(SPAN_TAG_RE)) {
+            const tag = m[0];
+            let drop;
+            if (tag[1] === '/') {
+                drop = stack.length ? stack.pop() : false;
+            } else {
+                drop = OUR_SPAN_RE.test(tag);
+                stack.push(drop);
+            }
+            if (drop) {
+                out += s.slice(last, m.index);
+                last = m.index + tag.length;
+            }
+        }
+        return out + s.slice(last);
+    }
 
     /**
      * Ephemeral prompt fix. Replaces each changed message in `chat` (the array handed to a
@@ -170,29 +298,46 @@
         return changed;
     }
 
-    /** Fix msg.mes and every stored swipe. Returns true if anything changed. */
-    function fixMessage(msg, mode) {
+    /**
+     * Fix msg.mes (and the swipe it shows). With allSwipes, every stored swipe is fixed
+     * too; that is only needed for the explicit "rewrite saved messages" action.
+     * Returns true if anything changed.
+     */
+    function fixMessage(msg, mode, { allSwipes = false } = {}) {
         if (!msg || typeof msg.mes !== 'string') return false;
         let changed = false;
 
-        const fixedMes = fixText(msg.mes, mode);
-        if (fixedMes !== msg.mes) {
+        const before = msg.mes;
+        const fixedMes = fixText(before, mode);
+        if (fixedMes !== before) {
             msg.mes = fixedMes;
             changed = true;
         }
         if (Array.isArray(msg.swipes)) {
-            msg.swipes = msg.swipes.map((s) => {
-                const f = fixText(s, mode);
-                if (f !== s) changed = true;
-                return f;
-            });
+            if (allSwipes) {
+                msg.swipes = msg.swipes.map((s) => {
+                    const f = fixText(s, mode);
+                    if (f !== s) changed = true;
+                    return f;
+                });
+            } else {
+                const id = msg.swipe_id;
+                const cur = Number.isInteger(id) ? msg.swipes[id] : undefined;
+                if (typeof cur === 'string') {
+                    const f = cur === before ? msg.mes : fixText(cur, mode);
+                    if (f !== cur) {
+                        msg.swipes[id] = f;
+                        changed = true;
+                    }
+                }
+            }
         }
         return changed;
     }
 
     // Allow running the core in Node for tests; harmless inside SillyTavern.
     if (typeof module !== 'undefined' && module.exports) {
-        module.exports = { fixText, fixMessage, fixPromptChat, stripSpans, markersToHtml };
+        module.exports = { fixText, fixTextCached, fixMessage, fixPromptChat, stripSpans, markersToHtml };
     }
 
     /* ------------------------------------------------------------------ *
@@ -201,20 +346,28 @@
 
     if (typeof SillyTavern === 'undefined') return;
 
-    const state = { renderHookInstalled: false };
+    const state = { renderHookInstalled: false, scanning: false };
 
+    /** Reads (and once, migrates) the settings object. Called at start-up only. */
     function loadSettings() {
         const { extensionSettings } = SillyTavern.getContext();
         if (!extensionSettings[MODULE]) extensionSettings[MODULE] = {};
         const cur = extensionSettings[MODULE];
         // Migrate the 1.1/1.2 "preferRenderHook" option to "Alter Chat Display".
-        if (cur.alterDisplay === undefined && cur.preferRenderHook !== undefined) cur.alterDisplay = cur.preferRenderHook;
-        delete cur.preferRenderHook;
+        if ('preferRenderHook' in cur) {
+            if (cur.alterDisplay === undefined) cur.alterDisplay = cur.preferRenderHook;
+            delete cur.preferRenderHook;
+        }
         for (const [k, v] of Object.entries(DEFAULTS)) {
             if (cur[k] === undefined) cur[k] = v;
         }
         return cur;
     }
+
+    // Loaded once; the settings UI mutates this same object. Hot paths (render hook,
+    // prompt interceptor) read it directly instead of calling getContext() every time.
+    let settings = null;
+    const getSettings = () => settings ?? (settings = loadSettings());
 
     const save = () => SillyTavern.getContext().saveSettingsDebounced();
     const applyStyleAttr = (s) => { document.body.dataset.nefStyle = s.style; };
@@ -225,8 +378,8 @@
         return {
             displayViaHook: s.alterDisplay && hook,
             // Same rule as the Regex extension: neither box = edit the saved text.
-            // Also the fallback when display alteration is requested but impossible.
-            rewriteSaved: (!s.alterDisplay && !s.alterPrompt) || (s.alterDisplay && !hook),
+            // Never used as a silent fallback for a missing render hook.
+            rewriteSaved: !s.alterDisplay && !s.alterPrompt,
             prompt: s.alterPrompt,
         };
     }
@@ -238,11 +391,12 @@
         if (p.prompt) parts.push('The outgoing prompt is fixed.');
         if (p.rewriteSaved) parts.push('Saved messages are rewritten (irreversible).');
         if (s.alterDisplay && !state.renderHookInstalled) {
-            parts.push('Alter Chat Display needs a newer SillyTavern (message formatting hook), so saved messages are rewritten instead.');
+            parts.push('Alter Chat Display needs a newer SillyTavern (message formatting hook), so the chat display is NOT fixed. Saved messages are left untouched; uncheck both boxes if you want them rewritten instead.');
         }
         if (!p.rewriteSaved && p.displayViaHook !== p.prompt) {
             parts.push('You will see one thing and the model will see another.');
         }
+        if (!p.displayViaHook && !p.prompt && !p.rewriteSaved) parts.push('Nothing is being fixed.');
         return parts.join(' ');
     }
 
@@ -254,10 +408,14 @@
         try {
             mf.addHook(
                 (mes, c) => {
-                    const s = loadSettings();
+                    if (typeof mes !== 'string') return mes;
+                    // Our markers must only ever come from us: drop any that are already
+                    // in the text (from the model, a card, or pasted input).
+                    if (mes.includes(MARK_OPEN) || mes.includes(MARK_CLOSE)) mes = mes.replace(MARKER_RE, '');
+                    const s = getSettings();
                     if (!s.enabled || !s.alterDisplay) return mes;
                     if (c && c.isUser && !s.fixUser) return mes;
-                    return fixText(mes, s.mode === 'style' ? 'marker' : 'strip');
+                    return fixTextCached(mes, s.mode === 'style' ? 'marker' : 'strip');
                 },
                 { stage: stage.AFTER_REGEX ?? 'afterRegex' },
             );
@@ -269,14 +427,15 @@
         }
     }
 
-    /** Neither checked (or display hook unavailable): fix the saved message before it renders. */
+    /** Neither box checked: fix the saved message before it renders. */
     function onMessageFixEvent(isUserEvent) {
         return (messageId) => {
-            const s = loadSettings();
+            const s = getSettings();
             if (!s.enabled || !plan(s).rewriteSaved) return;
             if (isUserEvent && !s.fixUser) return;
-            const { chat } = SillyTavern.getContext();
-            if (fixMessage(chat[messageId], s.mode)) console.debug(LOG, 'rewrote message', messageId);
+            const msg = SillyTavern.getContext().chat[messageId];
+            if (!msg || msg.is_system) return;
+            if (fixMessage(msg, s.mode)) console.debug(LOG, 'rewrote message', messageId);
         };
     }
 
@@ -287,7 +446,7 @@
      */
     globalThis.nestedEmphasisFixerInterceptor = async function (chat /*, contextSize, abort, type */) {
         try {
-            const s = loadSettings();
+            const s = getSettings();
             if (!s.enabled || !s.alterPrompt || !Array.isArray(chat)) return;
             const n = fixPromptChat(chat, { fixUser: s.fixUser });
             if (n) console.debug(LOG, `cleaned ${n} message(s) in the outgoing prompt`);
@@ -296,18 +455,60 @@
         }
     };
 
+    async function confirmAction(ctx, text) {
+        if (typeof ctx.callGenericPopup === 'function' && ctx.POPUP_TYPE) {
+            return Boolean(await ctx.callGenericPopup(text, ctx.POPUP_TYPE.CONFIRM));
+        }
+        return window.confirm(text);
+    }
+
     async function scanChat() {
-        const s = loadSettings();
+        if (state.scanning) return;
         const ctx = SillyTavern.getContext();
-        let count = 0;
-        ctx.chat.forEach((msg, i) => {
-            if (fixMessage(msg, s.mode)) {
-                count++;
-                if (typeof ctx.updateMessageBlock === 'function') ctx.updateMessageBlock(i, msg);
+        if (!Array.isArray(ctx.chat) || ctx.chat.length === 0) {
+            toastr.info('Nested Emphasis Fixer: no chat is open.');
+            return;
+        }
+        const s = getSettings();
+        const ok = await confirmAction(
+            ctx,
+            'Rewrite all saved messages (including every swipe) in the current chat with the current fix method? This changes the saved chat and cannot be undone.',
+        );
+        if (!ok) return;
+
+        state.scanning = true;
+        const $btn = $('#nef_scan').addClass('disabled');
+        try {
+            let count = 0;
+            ctx.chat.forEach((msg, i) => {
+                if (!msg || msg.is_system) return;
+                if (msg.is_user && !s.fixUser) return;
+                if (fixMessage(msg, s.mode, { allSwipes: true })) {
+                    count++;
+                    if (typeof ctx.updateMessageBlock === 'function') ctx.updateMessageBlock(i, msg);
+                }
+            });
+            if (count > 0 && typeof ctx.saveChat === 'function') await ctx.saveChat();
+            toastr.success(`Nested Emphasis Fixer: rewrote ${count} message(s).`);
+        } catch (err) {
+            console.error(LOG, 'rewriting saved messages failed:', err);
+            toastr.error('Nested Emphasis Fixer: rewriting saved messages failed, see the console.');
+        } finally {
+            state.scanning = false;
+            $btn.removeClass('disabled');
+        }
+    }
+
+    /** Strips our span markup from a chat-completion message (string or multimodal parts). */
+    function stripSpansFromMessage(m) {
+        if (!m) return;
+        if (typeof m.content === 'string') {
+            m.content = stripSpans(m.content);
+        } else if (Array.isArray(m.content)) {
+            for (const part of m.content) {
+                if (part && typeof part.text === 'string') part.text = stripSpans(part.text);
             }
-        });
-        if (count > 0 && typeof ctx.saveChat === 'function') await ctx.saveChat();
-        toastr.success(`Nested Emphasis Fixer: rewrote ${count} message(s).`);
+        }
     }
 
     function buildSettingsUi(s) {
@@ -369,10 +570,16 @@
         $('#extensions_settings2').append(html);
 
         const refreshStatus = () => $('#nef_status').text(describePlan(s));
+        let testTimer = 0;
         const refreshTest = () => {
             const t = String($('#nef_test_in').val());
             $('#nef_test_strip').text(fixText(t, 'strip'));
             $('#nef_test_style').text(fixText(t, 'style'));
+        };
+        // Debounced: large pastes are not re-processed on every keystroke.
+        const refreshTestSoon = () => {
+            clearTimeout(testTimer);
+            testTimer = setTimeout(refreshTest, 150);
         };
 
         $('#nef_enabled').prop('checked', s.enabled).on('change', function () { s.enabled = $(this).prop('checked'); save(); });
@@ -389,7 +596,7 @@
         });
         $('#nef_mode').val(s.mode).on('change', function () { s.mode = $(this).val(); save(); });
         $('#nef_style').val(s.style).on('change', function () { s.style = $(this).val(); applyStyleAttr(s); save(); });
-        $('#nef_test_in').on('input', refreshTest);
+        $('#nef_test_in').on('input', refreshTestSoon);
         $('#nef_scan').on('click', scanChat);
         refreshStatus();
         refreshTest();
@@ -397,7 +604,7 @@
 
     jQuery(() => {
         const ctx = SillyTavern.getContext();
-        const s = loadSettings();
+        const s = getSettings();
         applyStyleAttr(s);
 
         state.renderHookInstalled = tryInstallRenderHook(ctx);
@@ -408,13 +615,13 @@
         eventSource.on(event_types.MESSAGE_SENT, onMessageFixEvent(true));
 
         // Safety net, independent of the Ephemerality settings: our own styled <span> markup
-        // must never reach the model. (Event names per SillyTavern's events.js.)
+        // must never reach the model. Only spans with our exact class are removed, so the
+        // rest of the prompt (cards, system prompt) is not otherwise changed.
+        // (Event names per SillyTavern's events.js.)
         if (event_types.CHAT_COMPLETION_PROMPT_READY) {
             eventSource.on(event_types.CHAT_COMPLETION_PROMPT_READY, (data) => {
                 if (!data || !Array.isArray(data.chat)) return;
-                for (const m of data.chat) {
-                    if (typeof m.content === 'string') m.content = stripSpans(m.content);
-                }
+                for (const m of data.chat) stripSpansFromMessage(m);
             });
         }
         const textCompEvent = event_types.GENERATE_AFTER_COMBINE_PROMPTS;
